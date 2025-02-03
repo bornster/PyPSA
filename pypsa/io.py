@@ -11,9 +11,11 @@ import os
 from abc import abstractmethod
 from collections.abc import Collection, Iterable, Sequence
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.request import urlretrieve
 
+
+from pypsa.constants import CHP_POWER_LOSS_FACTOR_DEFAULT_VALUE, DECOM_START_EXISTING_CAP_DEFAULT_VALUE, DECOM_START_NEW_DEFAULT_VALUE, ENERGY_SOURCES, STO_CHARGING_EFFICIENCY_DEFAULT_VALUE, STO_SELF_DISCHARGE_DEFAULT_VALUE
 from pypsa.common import check_optional_dependency, deprecated_common_kwargs
 
 try:
@@ -28,7 +30,7 @@ import validators
 import xarray as xr
 from deprecation import deprecated
 from pyproj import CRS
-
+import xml.etree.ElementTree as ET
 from pypsa.descriptors import update_linkports_component_attrs
 
 if TYPE_CHECKING:
@@ -189,6 +191,7 @@ class ImporterCSV(Importer):
                     parse_dates=True,
                 )
                 yield attr, df
+                
 class ExporterCSV(Exporter):
     def __init__(self, csv_folder_name: Path | str, encoding: str | None) -> None:
         self.csv_folder_name = Path(csv_folder_name)
@@ -1758,3 +1761,190 @@ def import_from_pandapower_net(
     for component in n.iterate_components({"Line", "Transformer"}):
         component.static.replace({"bus0": to_replace}, inplace=True)
         component.static.replace({"bus1": to_replace}, inplace=True)
+
+def validate_fuel_type(fuel_type: str) -> str:
+    for key in ENERGY_SOURCES:
+        if (key.lower() in fuel_type.lower()):
+            return key
+    msg: str = f'Carrier of type {fuel_type} is not supported in H2RES model'
+    raise ValueError(msg)
+    
+def is_valid_life_time(life_time: float) -> bool: 
+    return not (math.isinf(life_time) or math.isnan(life_time) or life_time <= 0)
+
+def get_decomission_data(lifetime: float, decomission_age: float) -> float:
+    return max(lifetime - decomission_age, 0)
+
+def carrier_data_exists(carriers_df: pd.DataFrame,fuel_type: str) -> bool:
+    if (carriers_df is None or carriers_df.empty) :
+        return False
+    
+    if fuel_type not in carriers_df.index:
+        return False
+    
+    return True
+    
+    
+def is_default_max_growth(carriers_df: pd.DataFrame,fuel_type: str) -> bool:
+    
+    if not (carrier_data_exists(carriers_df, fuel_type)):
+        return True 
+    
+    carrier = (carriers_df.loc[carriers_df.index == fuel_type, 'max_growth']).iloc[0]
+
+    if (math.isinf(carrier) or pd.isna(carrier)):
+        return True
+    
+    return False  
+
+def is_default_co2_emissions(carriers_df: pd.DataFrame,fuel_type: str) -> bool:
+    
+    if not (carrier_data_exists(carriers_df, fuel_type)):
+        return True 
+    
+    carrier = (carriers_df.loc[carriers_df.index == fuel_type, 'co2_emissions']).iloc[0]
+    
+    if (carrier == 0.0):
+        return True
+    
+    return False
+
+def validate_technology(carrier: str, technology: str) -> str:
+    if (technology.upper() in ENERGY_SOURCES[carrier]['technology']):
+        return technology.upper()    
+    msg: str = f'Technology of type {technology} is not supported as a subtype of {carrier} in H2RES model. Allowed subtypes are {ENERGY_SOURCES[carrier.capitalize()]['technology']}'
+    raise ValueError(msg)
+
+def get_storage_capacity(storage_data_row: pd.Series) -> float:
+        capacity = storage_data_row.get('sto_capacity', pd.Series())
+
+        if not capacity.empty and capacity.iloc[0] != 0.0:
+            return capacity.iloc[0]
+            
+        p_nom = storage_data_row.get('p_nom', pd.Series())
+        max_hours = storage_data_row.get('max_hours', pd.Series())
+        if not (p_nom.empty and max_hours.empty):
+            return p_nom.iloc[0] * max_hours.iloc[0]
+        return 0.0
+    
+def is_chp_type(is_chp: Literal["Y","N"]):
+    if is_chp.upper() == "Y":
+        return True
+    elif is_chp.upper() == "N": 
+        return False
+    else:
+        msg = f'H2RES does not support chp_type values {is_chp}. Allowed values are \"Y\" and \"N\"'
+        raise ValueError(msg)
+    
+def get_self_discharge(storage_data_row: pd.Series) -> float: 
+    self_discharge = storage_data_row.get('standing_loss', pd.Series())
+
+    if (self_discharge.empty or self_discharge.iloc[0] == 0.0):
+        return STO_SELF_DISCHARGE_DEFAULT_VALUE
+    
+    return self_discharge.iloc[0]
+
+def get_sto_max_charging_power(storage_data_row: pd.Series) -> float:
+    sto_max_charging_power = storage_data_row.get('sto_max_charging_power', pd.Series())
+
+    if sto_max_charging_power.empty or sto_max_charging_power.iloc[0] == 0.0:
+        p_nom = storage_data_row.get('p_nom', pd.Series())
+        if (p_nom.empty):
+            return 0.0
+        return p_nom.iloc[0]
+    
+    return sto_max_charging_power.iloc[0]
+
+def get_sto_charging_efficiency(storage_data_row: pd.Series) -> float:
+    sto_charging_efficiency = storage_data_row.get('sto_charging_efficiency', pd.Series())
+    
+    if sto_charging_efficiency.empty or sto_charging_efficiency.iloc[0] == 0.0:
+        return STO_CHARGING_EFFICIENCY_DEFAULT_VALUE
+    return sto_charging_efficiency.iloc[0]
+    
+
+def generate_row(elements: dict) -> ET.Element:
+    row = ET.Element('row')
+    for row_name, row_value in elements.items():
+        ET.SubElement(row, row_name).text = str(row_value)
+    
+    return row
+
+def generate_row_data(index: str, generator_row_data: pd.Series, carrier_df: pd.DataFrame, storage_unit_row_data: pd.Series) -> dict[str, str]:
+    fuel_type: str = validate_fuel_type(generator_row_data['carrier'])
+    life_time: float = generator_row_data['lifetime'] if is_valid_life_time(generator_row_data['lifetime']) else ENERGY_SOURCES[fuel_type]['life_time']
+    max_inv_period: float = ENERGY_SOURCES[fuel_type]['max_growth'] if is_default_max_growth(carrier_df, generator_row_data['carrier']) else carrier_df.loc[carrier_df.index == generator_row_data['carrier'], 'max_growth'].iloc[0]
+    ramping_cost: float = ENERGY_SOURCES[fuel_type]['ramping_cost'] if generator_row_data['ramping_cost'] <= 0 else generator_row_data['ramping_cost'] 
+    co2_intensity: float = ENERGY_SOURCES[fuel_type]['co2_emissions'] if is_default_co2_emissions(carrier_df, generator_row_data['carrier']) else carrier_df.loc[carrier_df.index == generator_row_data['carrier'], 'co2_emissions'].iloc[0]
+    is_chp: bool = is_chp_type(generator_row_data['chp_type'])
+
+    storage_capacity = self_discharge = sto_max_charging_power = sto_charging_efficiency = 0.0
+    chp_power_to_heat = chp_power_loss = chp_max_heat = 0.0
+    
+    if (fuel_type == "Hydro" or is_chp):
+            storage_capacity = get_storage_capacity(storage_unit_row_data)
+            self_discharge = get_self_discharge(storage_unit_row_data)   
+            
+    if (fuel_type == "Hydro"):
+            sto_max_charging_power = get_sto_max_charging_power(storage_unit_row_data)
+            sto_charging_efficiency = get_sto_charging_efficiency(storage_unit_row_data)
+        
+    if (is_chp):
+            chp_power_to_heat = generator_row_data['chp_power_to_heat'] if not (pd.isna(generator_row_data['chp_power_to_heat'])) else generator_row_data['p_nom']
+            chp_power_loss = generator_row_data['chp_power_loss_factor'] if not (pd.isna(generator_row_data['chp_power_loss_factor'])) else CHP_POWER_LOSS_FACTOR_DEFAULT_VALUE
+            chp_max_heat = generator_row_data['chp_max_heat'] if not (pd.isna(generator_row_data['chp_max_heat'])) else generator_row_data['p_nom']
+    
+    return {
+        'unit_name': index,
+        'cap_mw': generator_row_data['p_nom'],
+        'fuel_type': fuel_type,
+        'decom_start_existing_cap': get_decomission_data(life_time, DECOM_START_EXISTING_CAP_DEFAULT_VALUE),
+        'life_time': life_time,
+        'decom_start_new': get_decomission_data(life_time, DECOM_START_NEW_DEFAULT_VALUE),
+        'final_life_cap': ENERGY_SOURCES[fuel_type]['final_life_cap'],
+        'max_inv_period': max_inv_period,
+        'cap_factor': 1,
+        'efficiency': generator_row_data['efficiency'],
+        'cost_no_fuel': 0,
+        'cap_inv_cost': generator_row_data['capital_cost'],
+        'ramping_cost': ramping_cost,
+        'co2_intensity': co2_intensity,
+        'technology': validate_technology(fuel_type, generator_row_data['technology']),
+        'ramp_up_rate': generator_row_data['ramp_limit_up'],
+        'ramp_down_rate': generator_row_data['ramp_limit_down'],
+        'primary_reserve': 'N',
+        'secondary_reserve': 'N',
+        'stab_factor': 1,
+        'chp': (generator_row_data['chp_type']).upper(),
+        'sto_capacity': storage_capacity,
+        'sto_self_discharge': self_discharge,
+        'sto_max_charging_power': sto_max_charging_power,
+        'sto_charging_efficiency': sto_charging_efficiency,
+        'chp_power_to_heat': chp_power_to_heat,
+        'chp_power_loss': chp_power_loss,
+        'chp_max_heat': chp_max_heat  
+    }
+
+def export_to_h2res(
+    n: Network,
+    xml_folder_name: str | Path = "data",
+    ) -> None:
+    path = Path(xml_folder_name)
+    if not Path(xml_folder_name).is_dir():
+            logger.warning(f"Directory {xml_folder_name} does not exist, creating it")
+            Path(xml_folder_name).mkdir()
+    
+    fn = path.joinpath('genco_data_HR_sdewes.xml')
+    root = ET.Element('data')
+
+    n.generators['ramp_limit_down'] = n.generators['ramp_limit_down'].fillna(0)
+    n.generators['ramp_limit_up'] = n.generators['ramp_limit_up'].fillna(0)
+    
+    for index, row_data in n.generators.iterrows():
+        storage_unit_row_data = n.storage_units.loc[n.storage_units['bus'] == row_data['bus']]
+        row_elements = generate_row_data(index, row_data, n.carriers,storage_unit_row_data)
+        row = generate_row(row_elements)   
+        root.append(row)
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="\t", level=0)
+    tree.write(fn, encoding="utf-8")
